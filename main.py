@@ -290,7 +290,7 @@ def list_trips():
         
         trips_data.append({
             "id": trip.id,
-            "user_id": trip.user_id,
+            # "user_id": trip.user_id,
             
             # Location & Time
             "origin_city": trip.origin_city,
@@ -608,7 +608,7 @@ def transport_choice():
 
 @app.route("/hotel_choice",methods=["POST"])
 @login_required
-def transport_choice():
+def hotel_choice():
     data = request.get_json()
     trip_id = data.get('trip_id')
     if not trip_id:
