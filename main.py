@@ -16,7 +16,14 @@ from pydantic import BaseModel, EmailStr, ValidationError, field_validator, mode
 from datetime import date
 from typing import List, Optional, Literal 
 
+import pandas as pd
+import numpy as np
 # CHANGED: Removed FlaskForm, wtforms, and CSRFProtect imports
+
+bus=pd.read_excel('Bus_Timings_dataset.xlsx')
+flight=pd.read_excel('flight_data.xlsx')
+train=pd.read_excel('Train_Timings_dataset.xlsx')
+
 
 app = Flask(__name__)
 # You MUST change this secret key in production!
@@ -75,6 +82,7 @@ class Trip(db.Model):
 
     # Stored as JSON strings in TEXT columns
     preferences = db.Column(db.Text, nullable=True)  # '["museums", "parks"]'
+    dislikes = db.Column(db.Text, nullable=True) 
     mandatory_places = db.Column(db.Text, nullable=True)  # '["India Gate", "Red Fort"]'
 
     # --- Other Constraints ---
@@ -84,7 +92,10 @@ class Trip(db.Model):
     needs_transport = db.Column(db.Boolean, nullable=True)
     transport_type = db.Column(db.String(50), nullable=True)
     accommodation_type = db.Column(db.String(50), nullable=True)
-
+    acc_loc=db.Column(db.String(100), nullable=True)
+    mode=db.Column(db.String(100), nullable=True)
+    mode_id=db.Column(db.String(100), nullable=True)
+    hotel_id=db.Column(db.String(100), nullable=True)
 
 # --- FLASK-LOGIN CALLBACKS ---
 
@@ -141,17 +152,13 @@ class TripModel(BaseModel):
     
     # We expect lists of strings from the frontend
     preferences: List[str] 
+    dislikes: List[str] 
     mandatory_places: List[str]
 
     # Other Constraints
     food_preference: Literal["Veg-Only", "Any"]
     pace: Literal["Relaxed", "Moderate", "Fast-Paced"]
-    needs_accommodation: Optional[bool] = None
-    needs_transport: Optional[bool] = None
-    transport_type: Optional[Literal["Basic", "Economy", "Standard", "Premium", "Luxury"]] = None
-    accommodation_type: Optional[Literal["Basic", "Economy", "Standard", "Premium", "Luxury"]] = None
-
-    # --- NEW --- Advanced Validator
+     # --- NEW --- Advanced Validator
     # This checks that the end_date is not before the start_date
     @model_validator(mode='after')
     def check_dates(self) -> 'TripModel':
@@ -160,6 +167,15 @@ class TripModel(BaseModel):
                 # This will be sent to the frontend as an error
                 raise ValueError("End date cannot be before start date.")
         return self
+
+class TransModel(BaseModel):
+    needs_transport: Optional[bool] = None
+    transport_type: Optional[Literal["Basic", "Economy", "Standard", "Premium", "Luxury"]] = None
+
+class AccModel(BaseModel):
+    needs_accommodation: Optional[bool] = None
+    accommodation_type: Optional[Literal["Basic", "Economy", "Standard", "Premium", "Luxury"]] = None
+    acc_loc:Optional[str]= None
 
 
 # --- HELPER FUNCTION TO FORMAT Pydantic ERRORS ---
@@ -318,13 +334,10 @@ def create_trip():
             # so we must store the list as a JSON string.
 
             preferences=json.dumps(model.preferences),
+            dislikes=json.dumps(model.dislikes),
             mandatory_places=json.dumps(model.mandatory_places),
             food_preference=model.food_preference,  # ← ADD THIS
-            pace=model.pace,
-            needs_accommodation=model.needs_accommodation,
-            needs_transport=model.needs_transport,
-            transport_type=model.transport_type,
-            accommodation_type=model.accommodation_type
+            pace=model.pace
         )
 
         # 3. Add to the database
@@ -349,6 +362,8 @@ def update_transport():
     data = request.get_json()
 
     try:
+        # 1. Validate the incoming data using the Pydantic model
+        model = TransModel.model_validate(data)
         # 1. Get the trip_id from the raw JSON data
         trip_id = data.get('trip_id')
         if not trip_id:
@@ -369,17 +384,165 @@ def update_transport():
             trip.needs_transport = data['needs_transport']
         if 'transport_type' in data:
             trip.transport_type = data['transport_type']
-        if 'arr_dep' in data:
-            trip.arr_dep = data['arr_dep']
         db.session.commit()
         
         return jsonify({"message": "Trip details updated successfully!", "trip_id": trip.id}), 200
+    
+    except ValidationError as e:
+        # If validation fails, send back the formatted errors
+        return jsonify({"errors": format_pydantic_errors(e)}), 400
 
     except Exception as e:
         # Catch any other potential errors (like database errors)
         db.session.rollback()
         return jsonify({"errors": {"database": str(e)}}), 500
     
+
+
+@app.route("/transport_option",methods=["POST"])
+@login_required
+def transport_option():
+    data=request.get_json()
+    trip_id=data.get('trip_id')
+    trip = db.session.get(Trip, trip_id)
+    a_d=data.get('a_d')
+    if a_d=='a':
+        src=trip.origin_city
+        dest=trip.destination_city
+        start_date=trip.start_date
+    else:
+        src=trip.destination_city
+        dest=trip.origin_city
+        start_date=trip.end_date
+    bud_type=trip.transport_type
+    ppl=trip.num_people
+
+    
+    bus['departure_date'] = pd.to_datetime(bus['departure_date'])
+    start_date = pd.to_datetime(start_date).date()
+
+    # Filter the DataFrame
+    filtered_buses = bus[
+        (bus['source_city'] == src) &
+        (bus['destination_city'] == dest) &
+        (bus['departure_date'].dt.date == start_date) &
+        (bus['availability_seats'] >= ppl)
+    ]
+    
+    # Format the output as a list of lists of tuples
+    bus_result = []
+    for index, row in filtered_buses.iterrows():
+        bus_result.append([(row['bus_id'], row['price_INR'])])
+
+    budget_mapping = {
+        'basic': 1,
+        'economy': 2,
+        'standard': 3,
+        'premium': 4,
+        'luxury': 5
+    }
+
+    # Get the multiplier for the given budget type
+    multiplier = budget_mapping.get(bud_type.lower())
+
+
+    # Extract all prices to find min and max
+    prices = [item[0][1] for item in bus_result] # bus_data is list of lists of tuples, e.g. [[('VB-5001', 1196)]]
+    min_price = min(prices)
+    max_price = max(prices)
+    price_difference = max_price - min_price
+
+    # Calculate the upper price limit based on the budget type formula
+    # (multiplier / 5) * difference + min_price
+    upper_price_limit = (multiplier / 5) * price_difference + min_price
+
+    filtered_b = []
+    for bus_tuple_list in bus_result:
+        bus_id, price = bus_tuple_list[0] # Assuming each inner list has one tuple
+        if price <= upper_price_limit:
+            filtered_b.append(bus_id)
+    final_buses=filtered_buses[(bus['bus_id'].isin(filtered_b))]
+    
+    train.columns = train.columns.str.strip()
+    train['departure_date'] = pd.to_datetime(train['departure_date'])
+
+    # Filter the DataFrame
+    filtered_trains = train[
+        (train['source_city'] == src) &
+        (train['destination_city'] == dest) &
+        (train['departure_date'].dt.date == start_date) &
+        (train['availability_seats'] >= ppl)
+    ]
+    
+    # Format the output as a list of lists of tuples
+    train_result = []
+    for index, row in filtered_trains.iterrows():
+        train_result.append([(row['train_id'], row['price_INR'])])
+
+    # Extract all prices to find min and max
+    prices = [item[0][1] for item in train_result] # bus_data is list of lists of tuples, e.g. [[('VB-5001', 1196)]]
+    min_price = min(prices)
+    max_price = max(prices)
+    price_difference = max_price - min_price
+
+    # Calculate the upper price limit based on the budget type formula
+    # (multiplier / 5) * difference + min_price
+    upper_price_limit = (multiplier / 5) * price_difference + min_price
+
+    filtered_t = []
+    for train_tuple_list in train_result:
+        train_id, price = train_tuple_list[0] # Assuming each inner list has one tuple
+        if price <= upper_price_limit:
+            filtered_t.append(train_id)
+    final_trains=filtered_trains[(train['train_id'].isin(filtered_t))]
+
+    flight['departure_date'] = pd.to_datetime(flight['departure_date'])
+
+    # Filter the DataFrame
+    filtered_flights = flight[
+        (flight['source_city'] == src) &
+        (flight['destination_city'] == dest) &
+        (flight['departure_date'].dt.date == start_date) &
+        (flight['availability_seats'] >= ppl)
+    ]
+    
+    # Format the output as a list of lists of tuples
+    flight_result = []
+    for index, row in filtered_flights.iterrows():
+        flight_result.append([(row['flight_id'], row['price_INR'])])
+
+    # Extract all prices to find min and max
+    prices = [item[0][1] for item in flight_result] # bus_data is list of lists of tuples, e.g. [[('VB-5001', 1196)]]
+    min_price = min(prices)
+    max_price = max(prices)
+    price_difference = max_price - min_price
+
+    # Calculate the upper price limit based on the budget type formula
+    # (multiplier / 5) * difference + min_price
+    upper_price_limit = (multiplier / 5) * price_difference + min_price
+
+    filtered_f = []
+    for flight_tuple_list in flight_result:
+        flight_id, price = flight_tuple_list[0] # Assuming each inner list has one tuple
+        if price <= upper_price_limit:
+            filtered_f.append(flight_id)
+    final_flights=filtered_flights[(flight['flight_id'].isin(filtered_f))]
+
+    bus_data = final_buses.to_dict(orient='records') 
+    train_data = final_trains.to_dict(orient='records') 
+    flight_data = final_flights.to_dict(orient='records') 
+
+    # 2. Create the Master Dictionary
+    master_data = {
+        "bus": bus_data,
+        "train": train_data,
+        "flight": flight_data
+    }
+    json_output = json.dumps(master_data, indent=4, default=str)
+    return jsonify(json_output), 201
+    
+
+
 
 @app.route("/update_accomodation", methods=["POST"])
 @login_required
@@ -391,6 +554,7 @@ def update_accomodation():
     data = request.get_json()
 
     try:
+        model = AccModel.model_validate(data)
         # 1. Get the trip_id from the raw JSON data
         trip_id = data.get('trip_id')
         if not trip_id:
@@ -411,16 +575,49 @@ def update_accomodation():
             trip.needs_accommodation = data['needs_accommodation']
         if 'accommodation_type' in data:
             trip.accommodation_type = data['accommodation_type']
-        if 'location' in data:
-            trip.arr_dep=data["location"]
+        if 'acc_loc' in data:
+            trip.acc_loc=data["acc_loc"]
         db.session.commit()
         
         return jsonify({"message": "Trip details updated successfully!", "trip_id": trip.id}), 200
+
+    except ValidationError as e:
+        # If validation fails, send back the formatted errors
+        return jsonify({"errors": format_pydantic_errors(e)}), 400
 
     except Exception as e:
         # Catch any other potential errors (like database errors)
         db.session.rollback()
         return jsonify({"errors": {"database": str(e)}}), 500
+
+
+@app.route("/transport_choice",methods=["POST"])
+@login_required
+def transport_choice():
+    data = request.get_json()
+    trip_id = data.get('trip_id')
+    if not trip_id:
+        return jsonify({"errors": {"trip": "trip_id is missing from request."}}), 400
+
+    # 2. Find the trip in the database
+    trip = db.session.get(Trip, trip_id)
+    trip.mode=data['mode']
+    trip.mode_id=data['mode_id']
+    return jsonify({"message": "Choice updated successfully."}), 200
+
+
+@app.route("/hotel_choice",methods=["POST"])
+@login_required
+def transport_choice():
+    data = request.get_json()
+    trip_id = data.get('trip_id')
+    if not trip_id:
+        return jsonify({"errors": {"trip": "trip_id is missing from request."}}), 400
+
+    # 2. Find the trip in the database
+    trip = db.session.get(Trip, trip_id)
+    trip.hotel_id=data['hotel_id']
+    return jsonify({"message": "Choice updated successfully."}), 200
 
 
 @app.route("/logout", methods=["POST"])
