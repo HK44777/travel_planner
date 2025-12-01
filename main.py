@@ -398,148 +398,134 @@ def update_transport():
         return jsonify({"errors": {"database": str(e)}}), 500
     
 
-
-@app.route("/transport_option",methods=["POST"])
+@app.route("/transport_option", methods=["POST"])
 @login_required
 def transport_option():
-    data=request.get_json()
-    trip_id=data.get('trip_id')
-    trip = db.session.get(Trip, trip_id)
-    a_d=data.get('a_d')
-    if a_d=='a':
-        src=trip.origin_city
-        dest=trip.destination_city
-        start_date=trip.start_date
-    else:
-        src=trip.destination_city
-        dest=trip.origin_city
-        start_date=trip.end_date
-    bud_type=trip.transport_type
-    ppl=trip.num_people
+    try:
+        data = request.get_json()
+        trip_id = data.get('trip_id')
+        trip = db.session.get(Trip, trip_id)
 
-    
-    bus['departure_date'] = pd.to_datetime(bus['departure_date'])
-    start_date = pd.to_datetime(start_date).date()
+        if not trip:
+            return jsonify({"error": "Trip not found"}), 404
 
-    # Filter the DataFrame
-    filtered_buses = bus[
-        (bus['source_city'] == src) &
-        (bus['destination_city'] == dest) &
-        (bus['departure_date'].dt.date == start_date) &
-        (bus['availability_seats'] >= ppl)
-    ]
-    
-    # Format the output as a list of lists of tuples
-    bus_result = []
-    for index, row in filtered_buses.iterrows():
-        bus_result.append([(row['bus_id'], row['price_INR'])])
+        a_d = data.get('a_d')
+        if a_d == 'a':
+            src = trip.origin_city
+            dest = trip.destination_city
+            # Ensure start_date is a standard date object
+            if isinstance(trip.start_date, str):
+                start_date = pd.to_datetime(trip.start_date).date()
+            else:
+                start_date = trip.start_date
+        else:
+            src = trip.destination_city
+            dest = trip.origin_city
+            if isinstance(trip.end_date, str):
+                start_date = pd.to_datetime(trip.end_date).date()
+            else:
+                start_date = trip.end_date
 
-    budget_mapping = {
-        'basic': 1,
-        'economy': 2,
-        'standard': 3,
-        'premium': 4,
-        'luxury': 5
-    }
+        bud_type = trip.transport_type
+        ppl = trip.num_people
 
-    # Get the multiplier for the given budget type
-    multiplier = budget_mapping.get(bud_type.lower())
+        # Helper function to calculate price limit safely
+        def get_price_limit(transport_result, budget_type):
+            if not transport_result:  # If list is empty, return Infinity (accept nothing or all)
+                return 0
+            
+            prices = [item[0][1] for item in transport_result]
+            if not prices: return 0
 
+            budget_mapping = {'basic': 1, 'economy': 2, 'standard': 3, 'premium': 4, 'luxury': 5}
+            multiplier = budget_mapping.get(budget_type.lower(), 3) # Default to standard
+            
+            min_price = min(prices)
+            max_price = max(prices)
+            price_difference = max_price - min_price
+            return (multiplier / 5) * price_difference + min_price
 
-    # Extract all prices to find min and max
-    prices = [item[0][1] for item in bus_result] # bus_data is list of lists of tuples, e.g. [[('VB-5001', 1196)]]
-    min_price = min(prices)
-    max_price = max(prices)
-    price_difference = max_price - min_price
+        # --- PROCESS BUS ---
+        bus['departure_date'] = pd.to_datetime(bus['departure_date'])
+        
+        filtered_buses = bus[
+            (bus['source_city'] == src) & 
+            (bus['destination_city'] == dest) & 
+            (bus['departure_date'].dt.date == start_date) & 
+            (bus['available_seats'] >= ppl)
+        ].copy() # Use .copy() to avoid SettingWithCopy warnings
 
-    # Calculate the upper price limit based on the budget type formula
-    # (multiplier / 5) * difference + min_price
-    upper_price_limit = (multiplier / 5) * price_difference + min_price
+        # Logic to filter by price
+        if not filtered_buses.empty:
+            bus_result = []
+            for index, row in filtered_buses.iterrows():
+                bus_result.append([(row['bus_id'], row['price'])])
+            
+            limit = get_price_limit(bus_result, bud_type)
+            # Filter the dataframe directly
+            final_buses = filtered_buses[filtered_buses['price'] <= limit]
+        else:
+            final_buses = pd.DataFrame() # Empty if no buses found
 
-    filtered_b = []
-    for bus_tuple_list in bus_result:
-        bus_id, price = bus_tuple_list[0] # Assuming each inner list has one tuple
-        if price <= upper_price_limit:
-            filtered_b.append(bus_id)
-    final_buses=filtered_buses[(bus['bus_id'].isin(filtered_b))]
-    
-    train.columns = train.columns.str.strip()
-    train['departure_date'] = pd.to_datetime(train['departure_date'])
+        # --- PROCESS TRAIN ---
+        train.columns = train.columns.str.strip()
+        train['departure_date'] = pd.to_datetime(train['departure_date'])
+        
+        filtered_trains = train[
+            (train['source_city'] == src) & 
+            (train['destination_city'] == dest) & 
+            (train['departure_date'].dt.date == start_date) & 
+            (train['available_seats'] >= ppl)
+        ].copy()
 
-    # Filter the DataFrame
-    filtered_trains = train[
-        (train['source_city'] == src) &
-        (train['destination_city'] == dest) &
-        (train['departure_date'].dt.date == start_date) &
-        (train['availability_seats'] >= ppl)
-    ]
-    
-    # Format the output as a list of lists of tuples
-    train_result = []
-    for index, row in filtered_trains.iterrows():
-        train_result.append([(row['train_id'], row['price_INR'])])
+        if not filtered_trains.empty:
+            train_result = []
+            for index, row in filtered_trains.iterrows():
+                train_result.append([(row['train_id'], row['price'])])
+            
+            limit = get_price_limit(train_result, bud_type)
+            final_trains = filtered_trains[filtered_trains['price'] <= limit]
+        else:
+            final_trains = pd.DataFrame()
 
-    # Extract all prices to find min and max
-    prices = [item[0][1] for item in train_result] # bus_data is list of lists of tuples, e.g. [[('VB-5001', 1196)]]
-    min_price = min(prices)
-    max_price = max(prices)
-    price_difference = max_price - min_price
+        # --- PROCESS FLIGHT ---
+        flight['departure_date'] = pd.to_datetime(flight['departure_date'])
+        
+        filtered_flights = flight[
+            (flight['source_city'] == src) & 
+            (flight['destination_city'] == dest) & 
+            (flight['departure_date'].dt.date == start_date) & 
+            (flight['available_seats'] >= ppl)
+        ].copy()
 
-    # Calculate the upper price limit based on the budget type formula
-    # (multiplier / 5) * difference + min_price
-    upper_price_limit = (multiplier / 5) * price_difference + min_price
+        if not filtered_flights.empty:
+            flight_result = []
+            for index, row in filtered_flights.iterrows():
+                flight_result.append([(row['flight_id'], row['price'])])
+            
+            limit = get_price_limit(flight_result, bud_type)
+            final_flights = filtered_flights[filtered_flights['price'] <= limit]
+        else:
+            final_flights = pd.DataFrame()
 
-    filtered_t = []
-    for train_tuple_list in train_result:
-        train_id, price = train_tuple_list[0] # Assuming each inner list has one tuple
-        if price <= upper_price_limit:
-            filtered_t.append(train_id)
-    final_trains=filtered_trains[(train['train_id'].isin(filtered_t))]
+        # --- PREPARE RESPONSE ---
+        # Convert Timestamps to strings to avoid JSON errors
+        # We assume standard string conversion is fine for the response
+        
+        master_data = {
+            "bus": final_buses.to_dict(orient='records'),
+            "train": final_trains.to_dict(orient='records'),
+            "flight": final_flights.to_dict(orient='records')
+        }
 
-    flight['departure_date'] = pd.to_datetime(flight['departure_date'])
+        # FIX: Directly pass the dictionary to jsonify. 
+        # Do NOT use json.dumps() here.
+        return jsonify(master_data), 200
 
-    # Filter the DataFrame
-    filtered_flights = flight[
-        (flight['source_city'] == src) &
-        (flight['destination_city'] == dest) &
-        (flight['departure_date'].dt.date == start_date) &
-        (flight['availability_seats'] >= ppl)
-    ]
-    
-    # Format the output as a list of lists of tuples
-    flight_result = []
-    for index, row in filtered_flights.iterrows():
-        flight_result.append([(row['flight_id'], row['price_INR'])])
-
-    # Extract all prices to find min and max
-    prices = [item[0][1] for item in flight_result] # bus_data is list of lists of tuples, e.g. [[('VB-5001', 1196)]]
-    min_price = min(prices)
-    max_price = max(prices)
-    price_difference = max_price - min_price
-
-    # Calculate the upper price limit based on the budget type formula
-    # (multiplier / 5) * difference + min_price
-    upper_price_limit = (multiplier / 5) * price_difference + min_price
-
-    filtered_f = []
-    for flight_tuple_list in flight_result:
-        flight_id, price = flight_tuple_list[0] # Assuming each inner list has one tuple
-        if price <= upper_price_limit:
-            filtered_f.append(flight_id)
-    final_flights=filtered_flights[(flight['flight_id'].isin(filtered_f))]
-
-    bus_data = final_buses.to_dict(orient='records') 
-    train_data = final_trains.to_dict(orient='records') 
-    flight_data = final_flights.to_dict(orient='records') 
-
-    # 2. Create the Master Dictionary
-    master_data = {
-        "bus": bus_data,
-        "train": train_data,
-        "flight": flight_data
-    }
-    json_output = json.dumps(master_data, indent=4, default=str)
-    return jsonify(json_output), 201
+    except Exception as e:
+        # This will print the actual error to your terminal so you can debug
+        print(f"Error in transport_option: {e}")
+        return jsonify({"error": str(e)}), 500
     
 
 
@@ -603,6 +589,8 @@ def transport_choice():
     trip = db.session.get(Trip, trip_id)
     trip.mode=data['mode']
     trip.mode_id=data['mode_id']
+    db.session.commit()
+
     return jsonify({"message": "Choice updated successfully."}), 200
 
 
@@ -617,6 +605,8 @@ def hotel_choice():
     # 2. Find the trip in the database
     trip = db.session.get(Trip, trip_id)
     trip.hotel_id=data['hotel_id']
+    db.session.commit()
+
     return jsonify({"message": "Choice updated successfully."}), 200
 
 
