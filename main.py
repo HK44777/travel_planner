@@ -93,8 +93,10 @@ class Trip(db.Model):
     transport_type = db.Column(db.String(50), nullable=True)
     accommodation_type = db.Column(db.String(50), nullable=True)
     acc_loc=db.Column(db.String(100), nullable=True)
-    mode=db.Column(db.String(100), nullable=True)
-    mode_id=db.Column(db.String(100), nullable=True)
+    up_mode=db.Column(db.String(100), nullable=True)
+    up_mode_id=db.Column(db.String(100), nullable=True)
+    down_mode=db.Column(db.String(100), nullable=True)
+    down_mode_id=db.Column(db.String(100), nullable=True)
     hotel_id=db.Column(db.String(100), nullable=True)
 
 # --- FLASK-LOGIN CALLBACKS ---
@@ -305,6 +307,41 @@ def list_trips():
     return jsonify(trips_data), 200
 
 
+@app.route("/delete_trip", methods=["POST"])
+@login_required
+def delete_trip_json():
+    data = request.get_json()
+    if not data or 'trip_id' not in data:
+        return jsonify({"error": "Missing 'trip_id' in JSON body"}), 400
+
+    try:
+        trip_id = data['trip_id']
+    except ValueError:
+        return jsonify({"error": "Invalid trip ID format. Must be an integer."}), 400
+    trip = Trip.query.filter_by(id=trip_id).first()
+    print(trip)
+    # 3. Handle case where the trip is not found or unauthorized
+    if trip is None:
+        return jsonify({"error": "Trip not found or unauthorized"}), 404
+
+    try:
+        # 4. Delete the trip
+        db.session.delete(trip)
+        
+        # 5. Commit the transaction
+        db.session.commit()
+        
+        # 6. Return success (200 OK with a confirmation message)
+        return jsonify({"message": f"Trip ID {trip_id} successfully deleted."}), 200
+        
+    except Exception as e:
+        # 7. Handle potential database errors
+        db.session.rollback()
+        print(f"Database error during trip deletion (POST): {e}")
+        return jsonify({"error": "An internal error occurred during deletion"}), 500
+    
+
+
 # --- NEW --- Endpoint to create a new trip
 @app.route("/create_trip", methods=["POST"])
 @login_required  # <-- Ensures only a logged-in user can create a trip
@@ -409,8 +446,8 @@ def transport_option():
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
 
-        a_d = data.get('a_d')
-        if a_d == 'a':
+        u_d = data.get('u_d')
+        if u_d == 'u':
             src = trip.origin_city
             dest = trip.destination_city
             # Ensure start_date is a standard date object
@@ -577,9 +614,9 @@ def update_accomodation():
         return jsonify({"errors": {"database": str(e)}}), 500
 
 
-@app.route("/transport_choice",methods=["POST"])
+@app.route("/up_transport_choice",methods=["POST"])
 @login_required
-def transport_choice():
+def up_transport_choice():
     data = request.get_json()
     trip_id = data.get('trip_id')
     if not trip_id:
@@ -587,8 +624,24 @@ def transport_choice():
 
     # 2. Find the trip in the database
     trip = db.session.get(Trip, trip_id)
-    trip.mode=data['mode']
-    trip.mode_id=data['mode_id']
+    trip.up_mode=data['up_mode']
+    trip.up_mode_id=data['up_mode_id']
+    db.session.commit()
+
+    return jsonify({"message": "Choice updated successfully."}), 200
+
+@app.route("/down_transport_choice",methods=["POST"])
+@login_required
+def down_transport_choice():
+    data = request.get_json()
+    trip_id = data.get('trip_id')
+    if not trip_id:
+        return jsonify({"errors": {"trip": "trip_id is missing from request."}}), 400
+
+    # 2. Find the trip in the database
+    trip = db.session.get(Trip, trip_id)
+    trip.down_mode=data['down_mode']
+    trip.down_mode_id=data['down_mode_id']
     db.session.commit()
 
     return jsonify({"message": "Choice updated successfully."}), 200
