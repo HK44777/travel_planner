@@ -97,8 +97,11 @@ class Trip(db.Model):
     up_mode_id=db.Column(db.String(100), nullable=True)
     down_mode=db.Column(db.String(100), nullable=True)
     down_mode_id=db.Column(db.String(100), nullable=True)
-    hotel_id=db.Column(db.String(100), nullable=True)
-
+    hotel_name=db.Column(db.String(100), nullable=True)
+    hotel_address=db.Column(db.String(100), nullable=True)
+    hotel_lat = db.Column(db.Float, nullable=True)
+    hotel_long = db.Column(db.Float, nullable=True)
+    hotel_price = db.Column(db.Float, nullable=True)
 # --- FLASK-LOGIN CALLBACKS ---
 
 # This callback is used to reload the user object from the user ID
@@ -647,6 +650,134 @@ def down_transport_choice():
     return jsonify({"message": "Choice updated successfully."}), 200
 
 
+import requests
+from typing import List, Dict, Any, Optional
+import hotels
+# from your_module import login_required 
+
+# Helper function to calculate price limit safely (Defined outside the endpoint)
+def get_price_limit_hotels(hotel_results: List[Dict[str, Any]], budget_type: str) -> float:
+    """
+    Calculates the maximum acceptable price based on min/max price and budget type.
+    """
+    if not hotel_results:
+        return 0.0
+    # print(hotel_results)
+    prices = []
+    for item in hotel_results:
+        try:
+            price = float(item.get('price')) 
+            prices.append(price)
+        except (ValueError, KeyError, TypeError):
+            continue
+
+    if not prices:
+        return 0.0
+
+    budget_mapping = {'basic': 1, 'economy': 2, 'standard': 3, 'premium': 4, 'luxury': 5}
+    multiplier = budget_mapping.get(budget_type.lower(), 3)
+
+    min_price = min(prices)
+    # print(min_price)
+    max_price = max(prices)
+    # print(max_price)
+    price_difference = max_price - min_price
+    f_p=(multiplier / 5) * price_difference + min_price
+    # print(f_p)
+    return f_p
+
+
+@app.route("/hotel_option", methods=["POST"])
+# @login_required # Uncomment if you use this decorator
+def hotel_option():
+    try:
+        data = request.get_json()
+        
+        # trip_id = data.get('trip_id')
+        # trip = db.session.get(Trip, trip_id)
+        
+        # city = trip.origin_city
+        # --- 1. Extract Input ---
+        lat = data.get('lat')
+        lon = data.get('lon')
+        check_in = data.get('check_in')
+        check_out = data.get('check_out')
+        bud_type = data.get('budget_type')
+        
+        if not all([lat, lon, check_in, check_out, bud_type]):
+            return jsonify({"error": "Missing required parameters."}), 400
+
+        # --- 2. Fetch All Hotels ---
+        all_hotels = hotels.get_hotels_near(
+            lat=float(lat), 
+            lon=float(lon), 
+            check_in=check_in, 
+            check_out=check_out,
+            limit=50 
+        )
+        
+        if not all_hotels:
+            return jsonify([]), 200 # Return empty list if no hotels found
+
+        # --- 3. Determine Price Limit and Filter Hotels ---
+        limit = get_price_limit_hotels(all_hotels, bud_type)
+        
+        if limit <= 0:
+             return jsonify([]), 200 # Return empty list if limit is invalid
+
+        
+        final_hotels_raw = []
+        for h in all_hotels:
+            try:
+                current_price = float(h.get('price')) 
+                h['price'] = current_price # Ensure numeric price
+                
+                if current_price <= limit:
+                    final_hotels_raw.append(h)
+            except (ValueError, TypeError):
+                continue
+        
+        # Sort the final list in DESCENDING order of price
+        final_hotels_raw.sort(key=lambda x: float(x.get('price', 0)), reverse=True)
+
+        # --- 4. Final Data Shaping (Filtering and Renaming Keys) ---
+        final_hotels_raw.sort(key=lambda x: float(x.get('price', 0)), reverse=True)
+        # Define the keys from hotel_finder and their desired final names
+        REQUIRED_KEYS_MAP = {
+            "hotel_name": "name",
+            "hotel_id": "id", 
+            "latitude": "lat", 
+            "longitude": "long", 
+            "address": "address",
+            "price": "price",
+            "currency": "currency" # Keeping currency is best practice for price clarity
+        }
+        
+        final_hotels_filtered = []
+        for h_raw in final_hotels_raw:
+            filtered_item = {}
+            for raw_key, final_key in REQUIRED_KEYS_MAP.items():
+                filtered_item[final_key] = h_raw.get(raw_key)
+                
+            final_hotels_filtered.append(filtered_item)
+            
+
+        # --- 5. Return Final List as JSON ---
+        
+        # This returns the list of hotel dictionaries directly, as requested.
+        return jsonify(final_hotels_filtered), 200
+
+    except requests.exceptions.RequestException as e:
+        print(f"External API error: {e}")
+        return jsonify({"error": "External data service unavailable."}), 503 
+
+    except Exception as e:
+        print(f"Internal error in hotel_option: {e}")
+        return jsonify({"error": "An unexpected server error occurred."}), 500
+
+
+
+
 @app.route("/hotel_choice",methods=["POST"])
 @login_required
 def hotel_choice():
@@ -657,7 +788,11 @@ def hotel_choice():
 
     # 2. Find the trip in the database
     trip = db.session.get(Trip, trip_id)
-    trip.hotel_id=data['hotel_id']
+    trip.hotel_name=data['hotel_name']
+    trip.hotel_address=data['hotel_address']
+    trip.hotel_lat=data['hotel_lat']
+    trip.hotel_long=data['hotel_long']
+    trip.hotel_price=data['hotel_price']
     db.session.commit()
 
     return jsonify({"message": "Choice updated successfully."}), 200
