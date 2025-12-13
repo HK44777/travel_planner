@@ -15,21 +15,30 @@ from flask_cors import CORS
 from pydantic import BaseModel, EmailStr, ValidationError, field_validator, model_validator, PositiveInt 
 from datetime import date
 from typing import List, Optional, Literal 
-
+from tasks import perform_clustering, get_travel_cost
+from celery.result import AsyncResult
+import tasks # Import the module to access the celery instance config if needed
 import pandas as pd
 import numpy as np
+from datetime import datetime
 # CHANGED: Removed FlaskForm, wtforms, and CSRFProtect imports
+
+t={}
+t_r={}
+
 
 bus=pd.read_excel('Bus_Timings_dataset.xlsx')
 flight=pd.read_excel('flight_data.xlsx')
 train=pd.read_excel('Train_Timings_dataset.xlsx')
 
-
 app = Flask(__name__)
 # You MUST change this secret key in production!
 # It's required for Flask-Login sessions
-app.config["SECRET_KEY"] = "123546879"
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///users.db"
+from dotenv import load_dotenv
+
+load_dotenv() 
+app.config["SECRET_KEY"] =os.getenv("SECRET_KEY")
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("SQLALCHEMY_DATABASE_URI")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 # --- INITIALIZE EXTENSIONS ---
@@ -102,6 +111,21 @@ class Trip(db.Model):
     hotel_lat = db.Column(db.Float, nullable=True)
     hotel_long = db.Column(db.Float, nullable=True)
     hotel_price = db.Column(db.Float, nullable=True)
+
+
+class Itinerary(db.Model):
+    __tablename__ = 'itinerary'
+
+    id = db.Column(db.Integer, primary_key=True)
+    # Link it to your existing Trip table
+    trip_id = db.Column(db.Integer, db.ForeignKey('trip.id', ondelete='CASCADE'), unique=True, nullable=False)
+    # Store the entire structure here
+    daily_plan = db.Column(db.JSON, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    trip = db.relationship(
+        'Trip', 
+        backref=db.backref('itinerary', uselist=False, cascade="all, delete-orphan")
+    )
 # --- FLASK-LOGIN CALLBACKS ---
 
 # This callback is used to reload the user object from the user ID
@@ -379,13 +403,24 @@ def create_trip():
             food_preference=model.food_preference,  # ← ADD THIS
             pace=model.pace
         )
-
+        if model.budget_type is not None:
+            task1 = get_travel_cost.delay(model.destination_city, model.budget_type)
+            t["get_travel_cost"]=task1.id
+        d=model.end_date-model.start_date
+        task2 = perform_clustering.delay(
+        model.destination_city,
+        int(d.days+1),
+        model.mandatory_places,
+        model.preferences,
+        model.dislikes
+    )
+        t["perform_clustering"]=task2.id
         # 3. Add to the database
         db.session.add(new_trip)
         db.session.commit()
 
         # 4. Send a success response
-        return jsonify({"message": "Trip created successfully!", "trip_id": new_trip.id}), 201
+        return jsonify({"message": "Trip created successfully!", "trip_id": new_trip.id,"tasks":t}), 201
 
     except ValidationError as e:
         # If validation fails, send back the formatted errors
@@ -603,6 +638,45 @@ def update_accomodation():
             trip.accommodation_type = data['accommodation_type']
         if 'acc_loc' in data:
             trip.acc_loc=data["acc_loc"]
+
+        # 2. Prepare API request
+            url = "https://nominatim.openstreetmap.org/search"
+            params = {
+                'q': trip.acc_loc,
+                'format': 'json'
+            }
+            
+            # Nominatim usage policy requires a custom User-Agent to identify the application
+            # We need a unique User-Agent to avoid 403 Forbidden errors. 
+            headers = {
+                'User-Agent': 'FlaskGeocodingProject/1.0 (educational_test)' 
+            }
+
+            try:
+                # 3. Send request to Nominatim API
+                response = requests.get(url, params=params, headers=headers)
+                response.raise_for_status() # Raise an exception for HTTP errors
+                
+                data = response.json()
+                # 4. Handle empty results
+                if not data:
+                    return jsonify({'error': 'Location not found'}), 404
+
+                # 5. Extract data from the first result
+                first_result = data[0]
+                trip.hotel_name=""
+                trip.hotel_lat=first_result.get('lat')
+                trip.hotel_long=first_result.get('lon')
+                task_result = AsyncResult(t["perform_clustering"], app=tasks.celery)
+                global t_r
+                t_r=task_result.result
+            except requests.RequestException as e:
+                return jsonify({'error': f'Error connecting to Nominatim API: {str(e)}'}), 502
+            
+            except Exception as e:
+                return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
+
+
         db.session.commit()
         
         return jsonify({"message": "Trip details updated successfully!", "trip_id": trip.id}), 200
@@ -693,19 +767,38 @@ def hotel_option():
     try:
         data = request.get_json()
         
-        # trip_id = data.get('trip_id')
-        # trip = db.session.get(Trip, trip_id)
+        trip_id = data.get('trip_id')
+        trip = db.session.get(Trip, trip_id)
+        task_result = AsyncResult(t["perform_clustering"], app=tasks.celery)
         
         # city = trip.origin_city
-        # --- 1. Extract Input ---
-        lat = data.get('lat')
-        lon = data.get('lon')
-        check_in = data.get('check_in')
-        check_out = data.get('check_out')
-        bud_type = data.get('budget_type')
+        # --- 1. Extract Input ---......HERE CELERY TASK RESULT I SDH GET
+        global t_r
+        t_r=task_result.result
+        CITY_CENTERS = {
+            "mumbai": {"lat": 19.0760, "lon": 72.8777},
+            "bengaluru": {"lat": 12.9716, "lon": 77.5946},
+            "hyderabad": {"lat": 17.3850, "lon": 78.4867}
+        }
+
+        # Normalize the city name to handle case sensitivity/spaces
+        origin_city_key = trip.destination_city.strip().lower() if trip.origin_city else ""
+
+        # --- 2. Determine Lat/Lon ---
+        if origin_city_key in CITY_CENTERS:
+            # Use precise hardcoded values for specific cities
+            lat = CITY_CENTERS[origin_city_key]["lat"]
+            lon = CITY_CENTERS[origin_city_key]["lon"]
+        else:
+            # Fallback to the original centroid logic for other cities
+            lat = t_r["centroid"]["avg_lat"]
+            lon = t_r["centroid"]["avg_long"]
+        check_in = trip.start_date.strftime('%Y-%m-%d')
+        check_out = trip.end_date.strftime('%Y-%m-%d')
+        bud_type = trip.accommodation_type
         
         if not all([lat, lon, check_in, check_out, bud_type]):
-            return jsonify({"error": "Missing required parameters."}), 400
+            return jsonify({"error": "Missing required parameters.","t":t_r}), 400
 
         # --- 2. Fetch All Hotels ---
         all_hotels = hotels.get_hotels_near(
@@ -715,7 +808,7 @@ def hotel_option():
             check_out=check_out,
             limit=50 
         )
-        
+        print(all_hotels)
         if not all_hotels:
             return jsonify([]), 200 # Return empty list if no hotels found
 
@@ -741,7 +834,6 @@ def hotel_option():
         final_hotels_raw.sort(key=lambda x: float(x.get('price', 0)), reverse=True)
 
         # --- 4. Final Data Shaping (Filtering and Renaming Keys) ---
-        final_hotels_raw.sort(key=lambda x: float(x.get('price', 0)), reverse=True)
         # Define the keys from hotel_finder and their desired final names
         REQUIRED_KEYS_MAP = {
             "hotel_name": "name",
@@ -765,7 +857,7 @@ def hotel_option():
         # --- 5. Return Final List as JSON ---
         
         # This returns the list of hotel dictionaries directly, as requested.
-        return jsonify(final_hotels_filtered), 200
+        return jsonify({"hotels":final_hotels_filtered,"tasks":t_r}), 200
 
     except requests.exceptions.RequestException as e:
         print(f"External API error: {e}")
@@ -773,9 +865,7 @@ def hotel_option():
 
     except Exception as e:
         print(f"Internal error in hotel_option: {e}")
-        return jsonify({"error": "An unexpected server error occurred."}), 500
-
-
+        return jsonify({"error": f"Internal error in hotel_option: {e} ","tasks_id":t,"tasks":t_r}), 500
 
 
 @app.route("/hotel_choice",methods=["POST"])
@@ -796,6 +886,328 @@ def hotel_choice():
     db.session.commit()
 
     return jsonify({"message": "Choice updated successfully."}), 200
+
+
+from datetime import time,timedelta
+import datetime
+import ilp_sol
+import math
+
+# --- Helper: Time Parser for Sorting ---
+def parse_start_time(time_str):
+    """Converts '09:30 AM' -> 570 minutes for sorting"""
+    try:
+        # Expected format "HH:MM AM/PM"
+        t = pd.to_datetime(time_str, format='%I:%M %p')
+        return t.hour * 60 + t.minute
+    except:
+        return 9999 # Push to end if format fails
+
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    R = 6371  # Earth radius in km
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+# --- Helper: Update Cluster Stats ---
+def update_cluster_stats(cluster_id, cluster_data, all_places_dict):
+    """
+    Recalculates avg_score and mandatory_count for a specific cluster 
+    after a new place has been added.
+    """
+    place_ids = cluster_data[cluster_id]['place_ids']
+    if not place_ids:
+        return
+
+    total_score = 0
+    mandatory_count = 0
+    
+    for pid in place_ids:
+        place = all_places_dict.get(pid)
+        if place:
+            # Handle potential different score keys
+            score = place.get('smart_score', place.get('score', 0))
+            total_score += score
+            if place.get('is_mandatory'):
+                mandatory_count += 1
+    
+    new_avg = total_score / len(place_ids)
+    
+    # Update the data structure directly
+    cluster_data[cluster_id]['stats']['avg_score'] = round(new_avg, 2)
+    cluster_data[cluster_id]['stats']['mandatory_count'] = mandatory_count
+    # Note: We are not recalculating 'nearest_clusters' here to save time, 
+    # as centroid shift is usually negligible for one place.
+
+
+@app.route("/ilp_solver",methods=["POST"])
+@login_required
+def ilp_solver():
+    print("started")
+    data = request.get_json()
+    trip_id = data.get('trip_id')
+    trip = db.session.get(Trip, trip_id)
+    # start=trip.start_date
+    # end=trip.end_date
+    t_price=0
+    h_price=0
+    daily_timings=[]
+    thre_time = time(14, 30, 0)
+    if trip.budget_type is not None:
+        task_result = AsyncResult(t["get_travel_cost"], app=tasks.celery)
+        daily_price = task_result.result["final_cost"]
+    else:
+        if trip.needs_transport:
+            if trip.up_mode.lower()=="flight":
+                u=flight[(flight['flight_id'] == trip.up_mode_id) & 
+                        (flight['source_city'] == trip.origin_city) & 
+                        (flight['destination_city'] == trip.destination_city)]
+            elif trip.up_mode.lower()=="train":
+                u=train[(train['train_id'] == trip.up_mode_id) & 
+                        (train['source_city'] == trip.origin_city) & 
+                        (train['destination_city'] == trip.destination_city)]
+            else:
+                u=bus[(bus['bus_id'] == trip.up_mode_id) & 
+                        (bus['source_city'] == trip.origin_city) & 
+                        (bus['destination_city'] == trip.destination_city)]   
+            if trip.down_mode.lower()=="flight":
+                d=flight[(flight['flight_id'] == trip.down_mode_id) & 
+                        (flight['source_city'] == trip.destination_city) & 
+                        (flight['destination_city'] == trip.origin_city)]
+            elif trip.down_mode.lower()=="train":
+                d=train[(train['train_id'] == trip.down_mode_id) & 
+                        (train['source_city'] == trip.destination_city) & 
+                        (train['destination_city'] == trip.origin_city)]
+            else:
+                d=bus[(bus['bus_id'] == trip.down_mode_id) & 
+                        (bus['source_city'] == trip.destination_city) & 
+                        (bus['destination_city'] == trip.origin_city)]  
+            t_price=u["price"].iloc[0]+d["price"].iloc[0]
+            # print(pd.to_datetime(u["arrival_time"].iloc[0], format='%H:%M:%S').time())
+            # print(pd.to_datetime(u["arrival_time"].iloc[0], format='%H:%M:%S').time())
+            # if pd.to_datetime(u["arrival_time"].iloc[0], format='%H:%M:%S').time()>thre_time:
+            #     print(u["arrival_time"].iloc[0])
+            #     start = start + timedelta(days=1)
+            # if pd.to_datetime(u["arrival_time"].iloc[0], format='%H:%M:%S').time()<thre_time:
+            #     print(end)
+            #     end=end-timedelta(days=1)
+            #     print(end)
+
+        if trip.needs_accommodation:
+            h_price=trip.hotel_price
+        d=trip.end_date-trip.start_date
+        daily_price=((trip.budget_amount//trip.num_people)-t_price)//(d.days+1)-h_price
+    
+    if trip.needs_transport:
+        if trip.up_mode.lower()=="flight":
+            u=flight[(flight['flight_id'] == trip.up_mode_id) & 
+                    (flight['source_city'] == trip.origin_city) & 
+                    (flight['destination_city'] == trip.destination_city)&
+                    (flight['departure_date']==trip.start_date.strftime('%Y-%m-%d'))]
+        elif trip.up_mode.lower()=="train":
+            u=train[(train['train_id'] == trip.up_mode_id) & 
+                    (train['source_city'] == trip.origin_city) & 
+                    (train['destination_city'] == trip.destination_city)&
+                    (train['departure_date']==trip.start_date.strftime('%Y-%m-%d'))]
+        else:
+            u=bus[(bus['bus_id'] == trip.up_mode_id) & 
+                    (bus['source_city'] == trip.origin_city) & 
+                    (bus['destination_city'] == trip.destination_city)&
+                    (bus['departure_date']==trip.start_date.strftime('%Y-%m-%d'))]   
+        if trip.down_mode.lower()=="flight":
+            d=flight[(flight['flight_id'] == trip.down_mode_id) & 
+                    (flight['source_city'] == trip.destination_city) & 
+                    (flight['destination_city'] == trip.origin_city)&
+                    (flight['departure_date']==trip.end_date.strftime('%Y-%m-%d'))]
+        elif trip.down_mode.lower()=="train":
+            d=train[(train['train_id'] == trip.down_mode_id) & 
+                    (train['source_city'] == trip.destination_city) & 
+                    (train['destination_city'] == trip.origin_city)&
+                    (train['departure_date']==trip.end_date.strftime('%Y-%m-%d'))]
+        else:
+            d=bus[(bus['bus_id'] == trip.down_mode_id) & 
+                    (bus['source_city'] == trip.destination_city) & 
+                    (bus['destination_city'] == trip.origin_city)&
+                    (bus['departure_date']==trip.end_date.strftime('%Y-%m-%d'))]  
+        start = pd.to_datetime(u["arrival_date"].iloc[0]).date()
+        end = pd.to_datetime(d["departure_date"].iloc[0]).date()
+        arrival_dt = pd.to_datetime(u["arrival_time"].iloc[0], format='%H:%M:%S') + timedelta(hours=2)
+        if pd.to_datetime(u["arrival_time"].iloc[0], format='%H:%M:%S').time()>thre_time:
+            start = start + timedelta(days=1)
+            current_processing_date = start
+        else:
+            daily_timings.append([arrival_dt.hour * 60 + arrival_dt.minute, 20.5 * 60])
+            current_processing_date = start + timedelta(days=1)
+
+        # Loop until we reach the day BEFORE departure
+        while current_processing_date < end:
+            # Append Full Day Timings
+            # 9.5 * 60  = 9:30 AM (570 mins)
+            # 20.5 * 60 = 8:30 PM (1230 mins) -> CORRECTED from 8.5 (8:30 AM)
+            daily_timings.append([9.5 * 60, 20.5 * 60])
+            
+            # Move to next day
+            current_processing_date += timedelta(days=1)
+        dep_dt = pd.to_datetime(d["departure_time"].iloc[0], format='%H:%M:%S') - timedelta(hours=2)
+        if pd.to_datetime(d["departure_time"].iloc[0], format='%H:%M:%S').time()<thre_time:
+            end = end - timedelta(days=1)
+        else:
+            daily_timings.append([9*60,dep_dt.hour * 60 + dep_dt.minute])
+    
+
+    else:
+        start=trip.start_date
+        end=trip.end_date
+        current_processing_date = start 
+
+        # Loop until we reach the day BEFORE departure
+        while current_processing_date <=end:
+            # Append Full Day Timings
+            # 9.5 * 60  = 9:30 AM (570 mins)
+            # 20.5 * 60 = 8:30 PM (1230 mins) -> CORRECTED from 8.5 (8:30 AM)
+            daily_timings.append([9.5 * 60, 20.5 * 60])
+            
+            # Move to next day
+            current_processing_date += timedelta(days=1)
+
+
+    current_date = start
+    final_itinerary = {}
+    
+    # 1. Create a lookup for places by ID for easy access
+    all_places_dict = {p['id']: p for p in t_r['Places']}
+    
+    # 2. Identify available clusters (keys are strings "0", "1", etc.)
+    # We maintain a list of cluster IDs that haven't been processed yet
+    available_cluster_ids = list(t_r['clustering'].keys())
+    print("each day loop started")
+    # 3. Iterate through days
+    day_index=0
+    print(current_date)
+    print(end)
+    while current_date <= end:
+        date_str = current_date.strftime("%Y-%m-%d")
+        day_name = current_date.strftime("%A")
+        print(f"\n--- Processing: {date_str} | {day_name} ---")
+        
+        if not available_cluster_ids:
+            print("No more clusters available for this day.")
+            final_itinerary[date_str] = []
+            current_date += timedelta(days=1)
+            continue
+
+        # --- STEP A: Select Best Cluster ---
+        # Logic: Pick the available cluster with the MAX avg_score
+        best_cluster_id = max(
+            available_cluster_ids, 
+            key=lambda cid: t_r['clustering'][cid]['stats']['avg_score']
+        )
+        
+        print(f"Selected Cluster ID: {best_cluster_id} (Score: {t_r['clustering'][best_cluster_id]['stats']['avg_score']})")
+        
+        # Get places for this cluster
+        current_cluster_place_ids = t_r['clustering'][best_cluster_id]['place_ids']
+        day_places_data = [all_places_dict[pid] for pid in current_cluster_place_ids]
+        print(day_places_data)
+        # --- STEP B: Run ILP Solver ---
+        # Call your external function here
+        print("first ilp")
+        final_schedule, unvisited_ids = ilp_sol.generate_itinerary(day_places_data,trip.hotel_name,trip.hotel_lat,trip.hotel_long,day_name,daily_price,
+                                                                     trip.pace,daily_timings[day_index][0],daily_timings[day_index][1],trip.food_preference)
+        print("check done")
+        if isinstance(final_schedule["timeline"], dict):
+            print("Converting dictionary schedule to list...")
+            temp_list = []
+            for time_key, place_data in final_schedule["timeline"].items():
+                # If 'start_time' is missing, grab it from the key (e.g., "09:00 AM-10:00 AM")
+                if 'start_time' not in place_data:
+                    place_data['start_time'] = time_key.split('-')[0].strip()
+                temp_list.append(place_data)
+            final_schedule["timeline"] = temp_list
+        final_schedule["timeline"].sort(key=lambda x: parse_start_time(x.get('start_time', '11:59 PM')))
+        print(day_name+"  ilp success")
+        # Store successful itinerary
+        final_itinerary[date_str] = {
+            "day": day_name,
+            "date":date_str,
+            "places": final_schedule["timeline"],
+            "meals":final_schedule["restaurants"]
+        }
+
+        # --- STEP C: Handle Unvisited Mandatory Places ---
+        if unvisited_ids:
+            print(f"Unvisited IDs: {unvisited_ids}")
+            
+            # Remove current cluster from available list so we don't reassign back to it
+            # (We do this temporarily to find the *next* best cluster)
+            remaining_clusters = [cid for cid in available_cluster_ids if cid != best_cluster_id]
+            
+            if remaining_clusters:
+                for uid in unvisited_ids:
+                    place_obj = all_places_dict[uid]
+                    
+                    # Only care if it's mandatory
+                    if place_obj.get('is_mandatory'):
+                        print(f"  > Reassigning Mandatory Place: {place_obj['name']}")
+                        
+                        # Find nearest cluster
+                        p_lat = place_obj['latitude']
+                        p_long = place_obj['longitude']
+                        
+                        best_target_id = None
+                        min_dist = float('inf')
+                        
+                        for target_id in remaining_clusters:
+                            # Get centroid of target cluster
+                            # Ensure your centroid structure matches: clustered_data['centroid']['values'][target_id]
+                            c_vals = t_r['centroid']['values'].get(str(target_id))
+                            if not c_vals: continue
+                                
+                            dist = calculate_distance(p_lat, p_long, c_vals['lat'], c_vals['long'])
+                            
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_target_id = target_id
+                        
+                        if best_target_id:
+                            print(f"    -> Moved to Cluster {best_target_id} (Dist: {min_dist:.2f}km)")
+                            # 1. Add to new cluster's list
+                            t_r['clustering'][best_target_id]['place_ids'].append(uid)
+                            # 2. Update stats for that cluster (so selection logic sees new score)
+                            update_cluster_stats(best_target_id, t_r['clustering'], all_places_dict)
+                            # 3. Update the place's own cluster label for consistency
+                            place_obj['cluster_label'] = int(best_target_id)
+            else:
+                print("  > Warning: No remaining days to reassign mandatory places.")
+
+        # --- STEP D: Finalize Day ---
+        # Permanently remove the processed cluster from availability
+        available_cluster_ids.remove(best_cluster_id)
+        current_date += timedelta(days=1)
+        print(day_name+"  success clsuter reordering")
+        existing_itinerary = Itinerary.query.filter_by(trip_id=trip_id).first()
+
+        if existing_itinerary:
+            print(f"🔄 Itinerary exists for Trip {trip_id}. Updating...")
+            # UPDATE the existing row
+            existing_itinerary.daily_plan = final_itinerary# Update timestamp
+        else:
+            print(f"💾 Saving NEW itinerary for Trip {trip_id}...")
+            # CREATE a new row
+            new_itinerary = Itinerary(
+                trip_id=trip_id,
+                daily_plan=final_itinerary
+            )
+        db.session.add(new_itinerary)
+        db.session.commit()
+    return jsonify(final_itinerary), 200
+
+
 
 
 @app.route("/logout", methods=["POST"])

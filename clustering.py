@@ -42,8 +42,8 @@ X = df[['latitude', 'longitude']]
 # --- 3. Dynamic Constraint Calculation ---
 
 avg_places_per_day = total_places // K
-size_min = max(1, int(avg_places_per_day * 0.7)) 
-size_max = math.ceil(avg_places_per_day * 1.5)
+size_min = max(1, int(avg_places_per_day * 0.4)) 
+size_max = math.ceil(avg_places_per_day * 0.6)
 
 # Safety buffer for constraints
 if K * size_min > total_places:
@@ -115,14 +115,12 @@ for cluster_id, group_df in grouped:
     
     # 3. Nearest Clusters (New Function Call)
     # Convert cluster_id to int for indexing numpy array
-    nearest = get_nearest_clusters(int(cluster_id), cluster_centers, top_n=2)
     
     clustering_output[str(cluster_id)] = {
         "place_ids": place_ids,
         "stats": {
             "avg_score": avg_score,
-            "mandatory_count": mandatory_count,
-            "nearest_clusters": nearest
+            "mandatory_count": mandatory_count
         }
     }
 

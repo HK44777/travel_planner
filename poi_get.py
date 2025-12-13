@@ -2,7 +2,6 @@ import requests
 import os
 import time
 import math
-import re
 import json
 from statistics import mode, StatisticsError
 from dotenv import load_dotenv
@@ -11,7 +10,7 @@ from dotenv import load_dotenv
 # IMPORTANT: Ensure your SERPAPI_KEY is set in your environment or a .env file.
 # Note: The SERPAPI_KEY is hardcoded here for completion but should ideally be loaded from environment variables.
 load_dotenv()
-SERPAPI_KEY = "1cb08199e7115b3cb347dde6246bc0a817051cff9eabc407208d9a3deb515b3d"
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 
 # ==========================================
 # 1. CONFIGURATION
@@ -244,6 +243,16 @@ def process_final_list(places, disliked_categories):
         # 3. Schedule details
         hours_data = get_detailed_hours(p)
         cleaned_schedule = clean_schedule_text(hours_data['full_schedule'])
+        if cleaned_schedule=="Temporarily closed":
+            cleaned_schedule={
+                "monday": "9 AM-9 PM",
+                "tuesday": "9 AM-9 PM",
+                "wednesday": "9 AM-9 PM",
+                "thursday": "9 AM-9 PM",
+                "friday": "9 AM-9 PM",
+                "saturday": "9 AM-9 PM",
+                "sunday": "9 AM-9 PM"
+            }
         if cleaned_schedule=="Hours not available":
             cleaned_schedule={
                 "monday": "9 AM-9 PM",
@@ -386,7 +395,7 @@ def run_travel_planner_external(
     final_itinerary_list = process_final_list(raw_places, disliked_categories)
     
     # 5. Limit the list based on num_of_days
-    max_places = 10 * num_of_days
+    max_places = 5 * num_of_days
     
     # Since the list is already sorted by smart_score, slicing takes the "top" places
     limited_list = final_itinerary_list[:max_places]

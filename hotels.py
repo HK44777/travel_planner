@@ -2,12 +2,18 @@ import requests
 import random
 from typing import List, Dict, Any, Optional
 import datetime # Added for date validation
+import os
+from dotenv import load_dotenv
+
+load_dotenv()   # loads .env into environment variables
+
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 # --- Amadeus API Credentials and Endpoints ---
 # NOTE: These are test credentials provided by Amadeus and may require 
 # occasional refreshing or replacement.
-CLIENT_ID = "iDPASHzbUKKh5CpEzNBF35t5UPntf4lf"
-CLIENT_SECRET = "x4YdAPKK5vhPrpxH"
+
 
 AUTH_URL = "https://test.api.amadeus.com/v1/security/oauth2/token"
 HOTELS_BY_GEOCODE_URL = "https://test.api.amadeus.com/v1/reference-data/locations/hotels/by-geocode"
