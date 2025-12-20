@@ -326,6 +326,8 @@ def list_trips():
             "destination_city": trip.destination_city,
             "start_date": trip.start_date.isoformat(), # Format as "YYYY-MM-DD" string
             "end_date": trip.end_date.isoformat(),
+            "budget_type":trip.budget_type,
+            "budget_amount":trip.budget_amount,
             # Calculated field
             "days_left": days_left
         })
